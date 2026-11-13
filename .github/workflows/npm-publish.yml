@@ -1,0 +1,234 @@
+# Workflow for publishing the DBHub package to npm and the MCP Registry
+# This workflow has two trigger modes:
+#
+# 1. Manual trigger (workflow_dispatch):
+#    - Allows manually specifying version and tag
+#    - Useful for deliberate releases
+#
+# 2. Automatic trigger (on push to main branch that modifies package.json):
+#    - Detects if the version has changed
+#    - Automatically determines the appropriate npm tag based on version format
+#    - Skips publishing if the version already exists on npm
+#
+# After a successful npm publish, the same job publishes server.json to the MCP
+# Registry (the registry validates that the referenced npm package version
+# exists, so this must run after npm publish succeeds). A guard skips the
+# registry publish if server.json's version is already registered.
+#
+# Authentication: Uses OIDC trusted publishing (no npm tokens required)
+# Prerequisites: Configure trusted publisher at https://www.npmjs.com/package/@Dxlxz/orrery-db/access
+#   - Organization/User: bytebase (or your npm org)
+#   - Repository: orrery-db
+#   - Workflow filename: npm-publish.yml
+#   - Environment: (leave empty unless using GitHub environments)
+
+name: Publish to npm and MCP Registry
+
+on:
+  # Manual trigger with customizable version and tag
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g., 0.1.0, 0.2.0-beta)"
+        required: false
+        default: ""
+      tag:
+        description: "NPM tag (e.g., latest, dev)"
+        required: false
+        default: "latest"
+
+  # Automatic trigger when package.json changes in main branch
+  push:
+    branches:
+      - main
+    paths:
+      - "package.json"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    # Required permissions for OIDC trusted publishing
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Checkout the repository to get access to the code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Node.js (no registry-url needed for OIDC trusted publishing)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Upgrade npm for OIDC trusted publishing support (requires npm 11.5+).
+      # Bootstrap without npm since Node 22.22.2 ships with broken npm (missing promise-retry).
+      # Pinned to 11.x: npm 12.0.0's `publish --provenance` is broken
+      - name: Upgrade npm
+        run: |
+          npm_tarball=$(curl -fsSL https://registry.npmjs.org/npm/latest | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).dist.tarball")
+          curl -fsSL "$npm_tarball" | tar xz -C /tmp
+          node /tmp/package/bin/npm-cli.js install -g npm@11
+          rm -rf /tmp/package
+          echo "npm version: $(npm --version)"
+
+      # Install pnpm for faster and more reliable package management
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10.17.1
+
+      # Install project dependencies
+      - name: Install dependencies
+        run: pnpm install
+
+      # Build the project (compile TypeScript to JavaScript)
+      - name: Build
+        run: pnpm run build
+
+      # Determine if we need to publish and what version/tag to use
+      - name: Check version and prepare for publishing
+        run: |
+          # Get current version from package.json
+          CURRENT_VERSION=$(jq -r '.version' package.json)
+
+          # CASE 1: Manual workflow trigger with specified version
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="${{ inputs.tag }}"
+            SHOULD_PUBLISH="true"
+            echo "Manual trigger: Using provided version ${VERSION} with tag ${TAG}"
+
+          # CASE 2: Automatic trigger from package.json changes
+          else
+            VERSION="${CURRENT_VERSION}"
+            
+            # Check if this version already exists in npm registry to avoid duplicates
+            if npm view @Dxlxz/orrery-db@${VERSION} version &> /dev/null; then
+              echo "Version ${VERSION} already exists in npm registry. Skipping publish."
+              SHOULD_PUBLISH="false"
+            else
+              echo "Version ${VERSION} is new. Proceeding with publish."
+              SHOULD_PUBLISH="true"
+              
+              # Determine appropriate npm tag based on version format:
+              # - For prerelease versions like "0.1.0-beta", use "beta" as the tag
+              # - For stable versions like "1.0.0", use "latest" as the tag
+              if [[ "${VERSION}" == *"-"* ]]; then
+                # Extract tag from version string (e.g., "beta" from "0.1.0-beta")
+                TAG=$(echo "${VERSION}" | cut -d'-' -f2 | cut -d'.' -f1)
+                echo "Prerelease version detected. Using '${TAG}' npm tag."
+              else
+                TAG="latest"
+                echo "Stable version detected. Using 'latest' npm tag."
+              fi
+            fi
+          fi
+
+          # Store values as environment variables for use in later steps
+          echo "PACKAGE_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "NPM_TAG=${TAG}" >> $GITHUB_ENV
+          echo "SHOULD_PUBLISH=${SHOULD_PUBLISH}" >> $GITHUB_ENV
+
+          # Summary message
+          if [ "${SHOULD_PUBLISH}" = "true" ]; then
+            echo "Publishing version: ${VERSION} with tag: ${TAG}"
+          fi
+
+          # Only modify package.json if we're going to publish
+          if [ "${SHOULD_PUBLISH}" = "true" ]; then
+            # Step 1: Update package name and version
+            echo "Preparing package.json for publishing..."
+            jq --arg version "$VERSION" '.name = "@Dxlxz/orrery-db" | .version = $version' package.json > package.json.tmp
+            mv package.json.tmp package.json
+            
+            # Step 2: Configure which files to include in the published package
+            echo "Setting files to include in the npm package..."
+            jq '.files = ["dist/**/*", "LICENSE", "README.md"]' package.json > package.json.tmp
+            mv package.json.tmp package.json
+
+            # Step 3: Add binary entry for CLI usage (makes it executable with 'npx' or after global install)
+            echo "Adding bin entry for CLI usage..."
+            jq '.bin = {"orrery-db": "dist/index.js"}' package.json > package.json.tmp 
+            mv package.json.tmp package.json
+            
+            echo "Package.json prepared successfully for publishing"
+          else
+            echo "Skipping package.json modifications as we won't be publishing"
+          fi
+
+      # Publish the package to npm using OIDC trusted publishing
+      # Note: Must use npm (not pnpm) for OIDC - feature is implemented in npm CLI 11.5+
+      - name: Publish to npm
+        if: env.SHOULD_PUBLISH == 'true'
+        run: |
+          echo "Publishing @Dxlxz/orrery-db@${{ env.PACKAGE_VERSION }} with tag ${{ env.NPM_TAG }}..."
+          echo "npm version: $(npm --version)"
+          # --provenance enables OIDC authentication and signed attestation
+          # No NODE_AUTH_TOKEN needed - authentication via GitHub OIDC
+          npm publish --access public --tag ${{ env.NPM_TAG }} --provenance
+          echo "✅ Successfully published to npm with provenance!"
+
+      # ---- MCP Registry publish ----
+      # The registry validates that the npm package version referenced by
+      # server.json exists, so these steps come after npm publish. They are
+      # deliberately NOT gated on SHOULD_PUBLISH: if a previous run published to
+      # npm but failed to register (e.g. the registry checked npm before the new
+      # version had propagated), re-running the job must still register it.
+
+      # Skip if server.json's version is already in the MCP Registry.
+      - name: Check MCP Registry for existing version
+        run: |
+          NAME=$(jq -r '.name' server.json)
+          VERSION=$(jq -r '.version' server.json)
+          ENCODED_NAME=$(jq -rn --arg n "$NAME" '$n | @uri')
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://registry.modelcontextprotocol.io/v0/servers/${ENCODED_NAME}/versions/${VERSION}")
+          if [ "$STATUS" = "200" ]; then
+            echo "Version ${VERSION} of ${NAME} already exists in the MCP Registry. Skipping registry publish."
+            echo "SHOULD_PUBLISH_MCP=false" >> $GITHUB_ENV
+          else
+            echo "Version ${VERSION} of ${NAME} is new (registry returned ${STATUS}). Proceeding with registry publish."
+            echo "SHOULD_PUBLISH_MCP=true" >> $GITHUB_ENV
+          fi
+
+      # A freshly published version can take a little while to become visible on
+      # the npm registry, and the MCP Registry rejects a server.json that points
+      # at a version it cannot see yet. Poll until it is there.
+      - name: Wait for npm to serve the version
+        if: env.SHOULD_PUBLISH_MCP == 'true'
+        run: |
+          VERSION=$(jq -r '.version' server.json)
+          for attempt in $(seq 1 30); do
+            if npm view "@Dxlxz/orrery-db@${VERSION}" version &> /dev/null; then
+              echo "@Dxlxz/orrery-db@${VERSION} is visible on npm."
+              exit 0
+            fi
+            echo "Attempt ${attempt}/30: @Dxlxz/orrery-db@${VERSION} not visible on npm yet, retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::@Dxlxz/orrery-db@${VERSION} did not appear on npm within 5 minutes; cannot register it in the MCP Registry."
+          exit 1
+
+      - name: Install MCP Publisher
+        if: env.SHOULD_PUBLISH_MCP == 'true'
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/download/v1.7.9/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Login to MCP Registry
+        if: env.SHOULD_PUBLISH_MCP == 'true'
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        if: env.SHOULD_PUBLISH_MCP == 'true'
+        run: ./mcp-publisher publish
+
+      # Display a message when skipping publication
+      - name: Skip publishing
+        if: env.SHOULD_PUBLISH != 'true'
+        run: |
+          echo "⏭️ Skipping publish step because:"
+          echo "   - Version has not changed, or"
+          echo "   - Version already exists in the npm registry"
+          echo "To force publication, use the manual workflow trigger with a custom version."

@@ -1,0 +1,353 @@
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import type { Connector } from '../../interface.js';
+
+export interface DatabaseTestConfig {
+  expectedSchemas: string[];
+  expectedTables: string[];
+  expectedTestSchemaTable?: string;
+  testSchema?: string;
+  supportsStoredProcedures?: boolean;
+  expectedStoredProcedures?: string[];
+  supportsComments?: boolean;
+}
+
+/**
+ * The shared tests create `users` with columns `id`, `name`, ... unquoted, and
+ * engines differ in how they report such identifiers back (Oracle folds them
+ * to `USERS`, `ID`, `NAME`). Lookups by name here are therefore
+ * case-insensitive; the engine-specific suites assert the exact casing.
+ */
+function sameIdentifier(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+function findColumn<T extends { column_name: string }>(columns: T[], name: string): T | undefined {
+  return columns.find((col) => sameIdentifier(col.column_name, name));
+}
+
+function rowValue(row: Record<string, unknown>, key: string): unknown {
+  const actual = Object.keys(row).find((k) => sameIdentifier(k, key));
+  return actual === undefined ? undefined : row[actual];
+}
+
+export interface TestContainer {
+  getConnectionUri(): string;
+  stop(): Promise<void>;
+}
+
+/**
+ * Base class for database integration tests that provides common test patterns
+ */
+export abstract class IntegrationTestBase<TContainer extends TestContainer> {
+  protected container!: TContainer;
+  public connector!: Connector;
+  public connectionString!: string;
+  public config: DatabaseTestConfig;
+
+  constructor(config: DatabaseTestConfig) {
+    this.config = config;
+  }
+
+  /**
+   * Abstract methods that must be implemented by specific database test classes
+   */
+  abstract createContainer(): Promise<TContainer>;
+  abstract createConnector(): Connector;
+  abstract setupTestData(connector: Connector): Promise<void>;
+
+  /**
+   * Setup method to be called in beforeAll
+   */
+  async setup(): Promise<void> {
+    console.log('Starting database container...');
+    
+    this.container = await this.createContainer();
+    console.log('Container started, getting connection details...');
+    
+    this.connectionString = this.container.getConnectionUri();
+    console.log('Connection URI:', this.connectionString);
+    
+    this.connector = this.createConnector();
+    await this.connector.connect(this.connectionString);
+    console.log('Connected to database');
+    
+    await this.setupTestData(this.connector);
+    console.log('Test data setup complete');
+  }
+
+  /**
+   * Cleanup method to be called in afterAll
+   */
+  async cleanup(): Promise<void> {
+    // Stop the container even if disconnecting throws: a connector error
+    // here must not leak a running container into the next suite (or onto
+    // the CI runner). A disconnect that never settles is bounded only by the
+    // integration project's hookTimeout, not by this block.
+    try {
+      if (this.connector) {
+        await this.connector.disconnect();
+      }
+    } finally {
+      if (this.container) {
+        await this.container.stop();
+      }
+    }
+  }
+
+  createConnectionTests(): void {
+    describe('Connection', () => {
+      it('should validate DSN format', () => {
+        const sampleDSN = this.connector.dsnParser.getSampleDSN();
+        expect(sampleDSN).toContain('://');
+        expect(this.connector.dsnParser.isValidDSN(sampleDSN)).toBe(true);
+        expect(this.connector.dsnParser.isValidDSN('invalid-dsn')).toBe(false);
+      });
+    });
+  }
+
+  createSchemaTests(): void {
+    describe('Schema Operations', () => {
+      it('should list schemas', async () => {
+        const schemas = await this.connector.getSchemas();
+        this.config.expectedSchemas.forEach(expectedSchema => {
+          expect(schemas).toContain(expectedSchema);
+        });
+      });
+
+      it('should list tables in default schema', async () => {
+        const tables = await this.connector.getTables();
+        this.config.expectedTables.forEach(expectedTable => {
+          expect(tables).toContain(expectedTable);
+        });
+      });
+
+      if (this.config.testSchema && this.config.expectedTestSchemaTable) {
+        it('should list tables in specific schema', async () => {
+          const tables = await this.connector.getTables(this.config.testSchema);
+          expect(tables).toContain(this.config.expectedTestSchemaTable);
+        });
+      }
+
+      it('should list views without overlapping tables', async () => {
+        // Verifies getViews() is wired and its query executes against the real
+        // database. getTables() (tables, never views) and getViews() must be disjoint.
+        const tables = await this.connector.getTables();
+        const views = await this.connector.getViews();
+        expect(Array.isArray(views)).toBe(true);
+
+        const tableSet = new Set(tables);
+        for (const view of views) {
+          expect(tableSet.has(view)).toBe(false);
+        }
+      });
+
+      it('should check if table exists', async () => {
+        const firstTable = this.config.expectedTables[0];
+        expect(await this.connector.tableExists(firstTable)).toBe(true);
+        expect(await this.connector.tableExists('nonexistent_table')).toBe(false);
+        
+        if (this.config.testSchema && this.config.expectedTestSchemaTable) {
+          expect(await this.connector.tableExists(this.config.expectedTestSchemaTable, this.config.testSchema)).toBe(true);
+          expect(await this.connector.tableExists(this.config.expectedTestSchemaTable, 'public')).toBe(false);
+        }
+      });
+    });
+  }
+
+  createTableTests(): void {
+    describe('Table Schema Operations', () => {
+      it('should get table schema for users table', async () => {
+        const schema = await this.connector.getTableSchema('users');
+        expect(schema.length).toBeGreaterThan(0);
+        
+        const idColumn = findColumn(schema, 'id');
+        expect(idColumn).toBeDefined();
+        expect(idColumn?.is_nullable).toBe('NO');
+        
+        const nameColumn = findColumn(schema, 'name');
+        expect(nameColumn).toBeDefined();
+      });
+
+      it('should get table indexes', async () => {
+        const indexes = await this.connector.getTableIndexes('users');
+        expect(indexes.length).toBeGreaterThan(0);
+        
+        const primaryIndex = indexes.find(idx => idx.is_primary);
+        expect(primaryIndex).toBeDefined();
+        expect(primaryIndex?.column_names.some((c) => sameIdentifier(c, 'id'))).toBe(true);
+        
+        // Some databases automatically create unique indexes, others handle unique constraints differently
+        // We'll just verify we got at least the primary key index
+        expect(indexes.length).toBeGreaterThanOrEqual(1);
+      });
+    });
+  }
+
+  createSQLExecutionTests(): void {
+    describe('SQL Execution', () => {
+      it('should execute simple SELECT query', async () => {
+        const result = await this.connector.executeSQL('SELECT COUNT(*) as count FROM users', {});
+        expect(result.resultSets[0].rows).toHaveLength(1);
+        expect(Number(rowValue(result.resultSets[0].rows[0], 'count'))).toBeGreaterThanOrEqual(3);
+      });
+
+      it('should execute INSERT and SELECT', async () => {
+        const insertResult = await this.connector.executeSQL(
+          "INSERT INTO users (name, email, age) VALUES ('Test User', 'test@example.com', 25)", {}
+        );
+        expect(insertResult).toBeDefined();
+
+        const selectResult = await this.connector.executeSQL(
+          "SELECT * FROM users WHERE email = 'test@example.com'", {}
+        );
+        expect(selectResult.resultSets[0].rows).toHaveLength(1);
+        expect(rowValue(selectResult.resultSets[0].rows[0], 'name')).toBe('Test User');
+        expect(Number(rowValue(selectResult.resultSets[0].rows[0], 'age'))).toBe(25);
+      });
+
+      it('should keep every column when names repeat', async () => {
+        // Every driver's default row object is keyed by column name, so the
+        // second `n` used to overwrite the first (Dxlxz/orrery-db#484). The
+        // first column keeps its name; the repeat is suffixed `_1`.
+        const result = await this.connector.executeSQL(
+          'SELECT COUNT(*) AS n, COUNT(*) + 1 AS n FROM users', {}
+        );
+        expect(result.resultSets[0].rows).toHaveLength(1);
+        const row = result.resultSets[0].rows[0];
+        expect(Object.keys(row)).toHaveLength(2);
+        const first = Number(rowValue(row, 'n'));
+        expect(first).toBeGreaterThanOrEqual(3);
+        expect(Number(rowValue(row, 'n_1'))).toBe(first + 1);
+      });
+
+      it('should handle complex queries with joins', async () => {
+        const result = await this.connector.executeSQL(`
+          SELECT u.name, COUNT(o.id) as order_count
+          FROM users u
+          LEFT JOIN orders o ON u.id = o.user_id
+          GROUP BY u.id, u.name
+          HAVING COUNT(o.id) > 0
+          ORDER BY order_count DESC
+        `, {});
+        
+        expect(result.resultSets[0].rows.length).toBeGreaterThan(0);
+        expect(rowValue(result.resultSets[0].rows[0], 'name')).toBeDefined();
+        expect(rowValue(result.resultSets[0].rows[0], 'order_count')).toBeDefined();
+      });
+    });
+  }
+
+  createStoredProcedureTests(): void {
+    describe('Stored Procedures', () => {
+      it('should list stored procedures', async () => {
+        const procedures = await this.connector.getStoredProcedures();
+        if (this.config.expectedStoredProcedures) {
+          this.config.expectedStoredProcedures.forEach(expectedProc => {
+            expect(procedures).toContain(expectedProc);
+          });
+        }
+      });
+
+      if (this.config.expectedStoredProcedures?.length) {
+        it('should get stored procedure details', async () => {
+          const procedureName = this.config.expectedStoredProcedures[0];
+          const procedure = await this.connector.getStoredProcedureDetail(procedureName);
+          expect(procedure.procedure_name).toBe(procedureName);
+          expect(procedure.procedure_type).toMatch(/function|procedure/);
+        });
+      }
+    });
+  }
+
+  createCommentTests(): void {
+    describe('Table and Column Comments', () => {
+      it('should include description field in table schema columns', async () => {
+        const schema = await this.connector.getTableSchema('users');
+        expect(schema.length).toBeGreaterThan(0);
+
+        // Every column should have the description field (even if null)
+        for (const col of schema) {
+          expect(col).toHaveProperty('description');
+        }
+
+        if (this.config.supportsComments) {
+          // Databases with comments should return the descriptions we set
+          const nameColumn = findColumn(schema, 'name');
+          expect(nameColumn?.description).toBe('Full name of the user');
+
+          const emailColumn = findColumn(schema, 'email');
+          expect(emailColumn?.description).toBe('Unique email address');
+
+          // Columns without comments should have null description
+          const ageColumn = findColumn(schema, 'age');
+          expect(ageColumn?.description).toBeNull();
+        } else {
+          // Databases without comment support (SQLite) should return null
+          for (const col of schema) {
+            expect(col.description).toBeNull();
+          }
+        }
+      });
+
+      if (this.config.supportsComments) {
+        it('should return table comment via getTableComment', async () => {
+          expect(this.connector.getTableComment).toBeDefined();
+          const comment = await this.connector.getTableComment!('users');
+          expect(comment).toBe('Application users');
+        });
+
+        it('should return null for table without comment', async () => {
+          expect(this.connector.getTableComment).toBeDefined();
+          const comment = await this.connector.getTableComment!('orders');
+          expect(comment).toBeNull();
+        });
+      }
+    });
+  }
+
+  createErrorHandlingTests(): void {
+    describe('Error Handling', () => {
+      it('should handle invalid SQL gracefully', async () => {
+        await expect(
+          this.connector.executeSQL('SELECT * FROM nonexistent_table', {})
+        ).rejects.toThrow();
+      });
+
+      it('should handle connection errors', async () => {
+        const newConnector = this.createConnector();
+        await expect(
+          newConnector.executeSQL('SELECT 1', {})
+        ).rejects.toThrow(/Not connected to.*database/);
+      });
+
+      it('should handle invalid table schema requests', async () => {
+        const result = await this.connector.getTableSchema('nonexistent_table');
+        expect(Array.isArray(result)).toBe(true);
+        expect(result.length).toBe(0);
+      });
+
+      it('should keep the failing statement and its parameters out of stderr', async () => {
+        // A failing statement carries whatever the caller put in it, and stderr
+        // is retained and read more widely than the database itself — on the
+        // stdio transport it is the MCP client that collects it. The error is
+        // re-thrown to the caller, so nothing needs to be logged here.
+        // Parameters are passed because the connectors only reached their
+        // logging on the parameterized path.
+        const marker = 'orrery-db_stderr_marker_value';
+        const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        try {
+          await expect(
+            this.connector.executeSQL('SELECT * FROM nonexistent_table', {}, [marker])
+          ).rejects.toThrow();
+
+          const logged = stderr.mock.calls.map((args) => args.join(' ')).join('\n');
+          expect(logged).not.toContain(marker);
+          expect(logged).not.toContain('nonexistent_table');
+        } finally {
+          stderr.mockRestore();
+        }
+      });
+    });
+  }
+}

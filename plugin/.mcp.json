@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "orrery-db": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@Dxlxz/orrery-db@1.6.1",
+        "--transport",
+        "stdio",
+        "--config",
+        "${CLAUDE_PLUGIN_ROOT}/orrery-db.toml"
+      ],
+      "env": {
+        "ORRERY_DB_DSN": "${user_config.dsn}"
+      }
+    }
+  }
+}
